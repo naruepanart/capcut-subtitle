@@ -53,5 +53,5 @@ CapCut saves project drafts in specific directories. You need the path to the *s
 ## How to Build
 
 ```
-go build -ldflags="-s -w -X main.version=0.1" -o capcut-subtitle.exe main.go
+go build -ldflags="-s -w -X main.version=0.1 -X main.commit=$(git rev-parse HEAD) -X main.date=$(date +%Y-%m-%dT%H:%M:%S%z)" -o capcut-subtitle.exe .
 ```
