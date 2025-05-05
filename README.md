@@ -41,7 +41,7 @@ CapCut saves project drafts in specific directories. You need the path to the *s
 
 ## Expected Outcome
 
-*   A subtitle file named `output.srt` will be created in the **same directory** as the `capcut-subtitle.exe` executable. This file contains the extracted subtitles in the standard SubRip Text format, ready for use in video players or other editing software.
+*   A subtitle file named `subtitles.srt` will be created in the **same directory** as the `capcut-subtitle.exe` executable. This file contains the extracted subtitles in the standard SubRip Text format, ready for use in video players or other editing software.
 
 ## Troubleshooting
 
@@ -53,5 +53,5 @@ CapCut saves project drafts in specific directories. You need the path to the *s
 ## How to Build
 
 ```
-go build -ldflags="-s -w -X main.version=0.1" -o capcut-subtitle.exe main.go
+go build -trimpath -ldflags="-s -w" -o capcut-subtitle-json-to-srt.exe .
 ```

@@ -2,53 +2,23 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
-	"time"
+	"sync"
 )
 
-// toSRTTime converts microseconds to SRT time format (HH:MM:SS,mmm)
-func toSRTTime(microseconds int64) string {
-	milliseconds := microseconds / 1000
-	if milliseconds < 0 {
-		milliseconds = 0
-	}
-	duration := time.Duration(milliseconds) * time.Millisecond
+const (
+	millisPerHour   = 3600000
+	millisPerMinute = 60000
+	millisPerSecond = 1000
+)
 
-	hours := int(duration.Hours())
-	minutes := int(duration.Minutes()) % 60
-	seconds := int(duration.Seconds()) % 60
-	ms := int(duration.Milliseconds()) % 1000
+var digits = [10]byte{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9'}
 
-	return fmt.Sprintf("%02d:%02d:%02d,%03d", hours, minutes, seconds, ms)
-}
-
-var htmlTagRegex = regexp.MustCompile(`<[^>]*>`)
-
-// extractText cleans input text by removing brackets, HTML tags, and entities.
-func extractText(input string) string {
-	input = strings.ReplaceAll(input, "[", "")
-	input = strings.ReplaceAll(input, "]", "")
-	input = htmlTagRegex.ReplaceAllString(input, "")
-	replacements := map[string]string{
-		"&lt;":   "<",
-		"&gt;":   ">",
-		"&amp;":  "&",
-		"&quot;": `"`,
-		"&#39;":  "'",
-		"&nbsp;": " ",
-	}
-	for entity, replacement := range replacements {
-		input = strings.ReplaceAll(input, entity, replacement)
-	}
-	return input
-}
-
-// DraftContent represents the structure of the input JSON.
 type DraftContent struct {
 	Materials struct {
 		Texts []TextMaterial `json:"texts"`
@@ -56,45 +26,112 @@ type DraftContent struct {
 	Tracks []Track `json:"tracks"`
 }
 
-// TextMaterial contains text content and word timing information.
 type TextMaterial struct {
 	ID      string `json:"id"`
 	Content string `json:"content"`
-	Type    string `json:"type"`
 	Words   []Word `json:"words"`
 }
 
-// Word represents a single word with timing information.
 type Word struct {
-	Begin  int64  `json:"begin"`
-	End    int64  `json:"end"`
-	Text   string `json:"text"`
-	Style  int    `json:"style"`
-	TextID string `json:"text_id"`
+	Begin int64  `json:"begin"`
+	End   int64  `json:"end"`
+	Text  string `json:"text"`
 }
 
-// Track contains segments of media content.
 type Track struct {
 	Type     string    `json:"type"`
 	Segments []Segment `json:"segments"`
 }
 
-// Segment links material to its timing information.
 type Segment struct {
 	MaterialID      string    `json:"material_id"`
 	TargetTimerange Timerange `json:"target_timerange"`
 }
 
-// Timerange defines the start and duration of a segment.
 type Timerange struct {
 	Start    int64 `json:"start"`
 	Duration int64 `json:"duration"`
 }
 
-// Helper Functions
+var timeBufferPool = sync.Pool{
+	New: func() interface{} {
+		return new([12]byte)
+	},
+}
 
-// buildTextMaterialMap creates a map for efficient lookup of TextMaterial by ID.
-func buildTextMaterialMap(texts []TextMaterial) map[string]TextMaterial {
+func formatTime(microseconds int64) string {
+	milliseconds := microseconds / 1000
+	if milliseconds < 0 {
+		milliseconds = 0
+	}
+
+	buf := timeBufferPool.Get().(*[12]byte)
+	defer timeBufferPool.Put(buf)
+
+	hours := milliseconds / millisPerHour
+	milliseconds -= hours * millisPerHour
+	minutes := milliseconds / millisPerMinute
+	milliseconds -= minutes * millisPerMinute
+	seconds := milliseconds / millisPerSecond
+	ms := milliseconds - seconds*millisPerSecond
+
+	buf[0] = digits[hours/10]
+	buf[1] = digits[hours%10]
+	buf[2] = ':'
+	buf[3] = digits[minutes/10]
+	buf[4] = digits[minutes%10]
+	buf[5] = ':'
+	buf[6] = digits[seconds/10]
+	buf[7] = digits[seconds%10]
+	buf[8] = ','
+	buf[9] = digits[ms/100]
+	buf[10] = digits[(ms/10)%10]
+	buf[11] = digits[ms%10]
+
+	return string(buf[:])
+}
+
+func cleanText(input string) string {
+	if len(input) == 0 {
+		return input
+	}
+
+	var sb strings.Builder
+	inTag := false
+
+	for i := 0; i < len(input); {
+		switch input[i] {
+		case '<':
+			inTag = true
+			i++
+		case '>':
+			inTag = false
+			i++
+		case '[', ']':
+			i++
+		case '&':
+			if i+3 < len(input) && input[i+1] == 'l' && input[i+2] == 't' && input[i+3] == ';' {
+				sb.WriteByte('<')
+				i += 4
+			} else if i+3 < len(input) && input[i+1] == 'g' && input[i+2] == 't' && input[i+3] == ';' {
+				sb.WriteByte('>')
+				i += 4
+			} else {
+				sb.WriteByte(input[i])
+				i++
+			}
+		default:
+			if !inTag {
+				sb.WriteByte(input[i])
+			}
+			i++
+		}
+	}
+
+	return sb.String()
+}
+
+func buildTextMap(texts []TextMaterial) map[string]TextMaterial {
 	textMap := make(map[string]TextMaterial, len(texts))
 	for _, text := range texts {
 		textMap[text.ID] = text
@@ -102,111 +139,89 @@ func buildTextMaterialMap(texts []TextMaterial) map[string]TextMaterial {
 	return textMap
 }
 
-// readJSON reads and parses the JSON file.
-func readJSON(filename string) (DraftContent, error) {
-	data, err := os.ReadFile(filename)
+func readDraft(filename string) (DraftContent, error) {
+	file, err := os.Open(filename)
 	if err != nil {
-		return DraftContent{}, fmt.Errorf("failed to read file: %w", err)
+		return DraftContent{}, fmt.Errorf("failed to open file: %w", err)
 	}
+	defer file.Close()
 
 	var content DraftContent
-	err = json.Unmarshal(data, &content)
-	if err != nil {
-		return DraftContent{}, fmt.Errorf("failed to unmarshal JSON: %w", err)
+	if err := json.NewDecoder(bufio.NewReader(file)).Decode(&content); err != nil {
+		return DraftContent{}, fmt.Errorf("failed to parse JSON: %w", err)
 	}
 	return content, nil
 }
 
-// writeSRT writes the SRT formatted subtitles to a file.
-func writeSRT(filename string, tracks []Track, textMap map[string]TextMaterial, jsonFilename string) error { // Added jsonFilename
-	file, err := os.Create(filename)
-	if err != nil {
-		return fmt.Errorf("failed to create SRT file: %w", err)
-	}
-	defer file.Close()
+func createSubtitles(tracks []Track, textMap map[string]TextMaterial) *bytes.Buffer {
+	var buffer = bytes.NewBuffer(nil)
+	var subtitleIndex = 1
 
-	writer := bufio.NewWriter(file)
-	defer writer.Flush()
-
-	subtitleIndex := 1
 	for _, track := range tracks {
 		if track.Type != "text" {
 			continue
 		}
+
 		for _, segment := range track.Segments {
 			textMaterial, found := textMap[segment.MaterialID]
 			if !found {
-				fmt.Printf("Warning: Text material with ID %s not found in '%s'\n", segment.MaterialID, jsonFilename) // use jsonFilename
 				continue
 			}
 
-			text := extractText(textMaterial.Content)
-			var startTime, endTime string
-
 			if len(textMaterial.Words) > 0 {
 				for _, word := range textMaterial.Words {
-					startTime = toSRTTime(word.Begin)
-					endTime = toSRTTime(word.End)
-					wordText := extractText(word.Text)
-					_, err = fmt.Fprintf(writer, "%d\n%s --> %s\n%s\n\n", subtitleIndex, startTime, endTime, wordText)
-					if err != nil {
-						return fmt.Errorf("failed to write SRT entry: %w", err)
-					}
+					writeSubtitle(buffer, subtitleIndex, word.Begin, word.End, word.Text)
 					subtitleIndex++
 				}
 			} else {
-				startTime = toSRTTime(segment.TargetTimerange.Start)
-				endTime = toSRTTime(segment.TargetTimerange.Start + segment.TargetTimerange.Duration)
-				_, err = fmt.Fprintf(writer, "%d\n%s --> %s\n%s\n\n", subtitleIndex, startTime, endTime, text)
-				if err != nil {
-					return fmt.Errorf("failed to write SRT entry: %w", err)
-				}
+				startTime := segment.TargetTimerange.Start
+				endTime := startTime + segment.TargetTimerange.Duration
+				writeSubtitle(buffer, subtitleIndex, startTime, endTime, textMaterial.Content)
 				subtitleIndex++
 			}
 		}
 	}
-	return nil
+
+	return buffer
 }
 
-var version = "dev"
+func writeSubtitle(buffer *bytes.Buffer, index int, startTime int64, endTime int64, content string) {
+	buffer.WriteString(strconv.Itoa(index))
+	buffer.WriteByte('\n')
+	buffer.WriteString(formatTime(startTime))
+	buffer.WriteString(" --> ")
+	buffer.WriteString(formatTime(endTime))
+	buffer.WriteByte('\n')
+	buffer.WriteString(cleanText(content))
+	buffer.WriteString("\n\n")
+}
 
 func main() {
-	fmt.Println("App version:", version)
-
-	// Read file path
-	filePathBytes, err := os.ReadFile("file-path.txt")
+	filePath, err := os.ReadFile("file-path.txt")
 	if err != nil {
-		fmt.Println("Error reading configuration file 'file-path.txt':", err)
-		fmt.Println("Please ensure 'file-path.txt' exists and contains the name of the JSON file to process.")
-		return
-	}
-	jsonFilename := strings.TrimSpace(string(filePathBytes))
-	if jsonFilename == "" {
-		fmt.Println("Error: 'file-path.txt' is empty or contains only whitespace.")
-		fmt.Println("Please ensure 'file-path.txt' contains the name of the JSON file to process.")
+		fmt.Println("Error reading file path:", err)
 		return
 	}
 
-	// Read and parse JSON
-	draftContent, err := readJSON(jsonFilename)
+	filePath = bytes.TrimSpace(filePath)
+	if len(filePath) == 0 {
+		fmt.Println("Empty file path")
+		return
+	}
+
+	draft, err := readDraft(string(filePath))
 	if err != nil {
-		fmt.Println(err)
+		fmt.Println("Error reading draft:", err)
 		return
 	}
 
-	// Build text material map
-	textMap := buildTextMaterialMap(draftContent.Materials.Texts)
+	textMap := buildTextMap(draft.Materials.Texts)
+	subtitles := createSubtitles(draft.Tracks, textMap)
 
-	// Generate SRT filename
-	randomSuffix := strconv.FormatInt(time.Now().UnixNano()%10_000_000_000, 10)
-	srtFilename := "subtitles-" + randomSuffix + ".srt"
-
-	// Convert and write SRT
-	err = writeSRT(srtFilename, draftContent.Tracks, textMap, jsonFilename) // Pass jsonFilename
-	if err != nil {
-		fmt.Println(err)
+	if err := os.WriteFile("subtitles.srt", subtitles.Bytes(), 0644); err != nil {
+		fmt.Println("Error writing subtitles:", err)
 		return
 	}
 
-	fmt.Printf("Successfully converted subtitles from '%s' to %s\n", jsonFilename, srtFilename)
+	fmt.Println("Subtitles created successfully")
 }
