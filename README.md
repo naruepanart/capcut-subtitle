@@ -1,4 +1,4 @@
-# capcut-subtitle
+# Capcut-subtitle-json-to-srt
 
 **A utility designed to extract subtitles from CapCut desktop project drafts into a standard `.srt` file.**
 
